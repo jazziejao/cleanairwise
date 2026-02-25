@@ -721,6 +721,8 @@
                     <button onclick="setPMTime(this, 'pm25', '21:00')" class="pm25-time-btn px-2 py-1 text-xs rounded bg-gray-200 dark:bg-slate-600">21:00</button>
                   </div>
                   <div class="color-bar-pm25 h-2 rounded-full"></div>
+
+                  <div class="color-bar-pm25 w-full h-3 rounded mb-1"></div>
                   <div class="flex justify-between text-xs text-gray-500 dark:text-gray-400 mono"><span>0</span><span>35</span><span>150+</span></div>
                 </div>
               </div>
@@ -1001,7 +1003,7 @@
                     </div>
                   </div>
 
-                  <div class="pt-2 h-36">
+                  <div class="pt-2 h-40">
                     <canvas id="ts-chart" class="w-full h-full"></canvas>
                   </div>
 
@@ -1156,7 +1158,53 @@
     let globalLSTBreaks = null;  // breaks for "all cities"
     let cityLSTBreaks = {};      // { cityKey: breaks[] }
 
+    // =====================
+    // PM2.5 (GeoTIFF) Globals
+    // =====================
+    let pm25Layers = {};                 // { cityKey: GeoRasterLayer }
+    let pm25RasterCache = {};            // { dateKey: { cityKey: { timeKey: georaster } } }
+    let globalPM25Breaks = {};           // { dateKey: { timeKey: breaks[] } }
+    let cityPM25Breaks = {};             // { dateKey: { timeKey: { cityKey: breaks[] } } }
 
+    // Map your city keys -> XX codes
+    const PM25_CITY_CODE = {
+      pasay: "PL",
+      gateway: "CL",   // Cubao (your "gateway" study area)
+      ayala: "AL",
+      lawton: "LL",
+    };
+
+    // AQI-like color stops (green -> yellow -> orange -> red -> purple -> maroon)
+    const PM25_STOPS = ["#00e400", "#ffff00", "#ff7e00", "#ff0000", "#8f3f97", "#7e0023"];
+
+    // Linear interpolate between two hex colors
+    function lerpColor(hex1, hex2, t) {
+      const a = hexToRgb(hex1);
+      const b = hexToRgb(hex2);
+      return rgbToHex(
+        Math.round(a.r + (b.r - a.r) * t),
+        Math.round(a.g + (b.g - a.g) * t),
+        Math.round(a.b + (b.b - a.b) * t)
+      );
+    }
+
+    // Build an n-color ramp across multiple stops
+    function makeMultiStopRamp(stops, n) {
+      if (!stops?.length) return [];
+      if (n <= 1) return [stops[stops.length - 1]];
+
+      const segs = stops.length - 1;
+      const out = [];
+
+      for (let i = 0; i < n; i++) {
+        const u = i / (n - 1);              // 0..1
+        const p = u * segs;                 // 0..segs
+        const si = Math.min(segs - 1, Math.floor(p));
+        const tt = p - si;
+        out.push(lerpColor(stops[si], stops[si + 1], tt));
+      }
+      return out;
+    }
     // =====================
     // Maps Initialization
     // =====================
@@ -1305,6 +1353,39 @@ function makeBlueRamp(n) {
   return out;
 }
 
+// linear ramp from very light green -> deep "UNG-like" green
+function makeGreenRamp(n) {
+  const start = hexToRgb('#f0fdf4'); // very light green
+  const end   = hexToRgb('#14532d'); // deep green
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const t = n === 1 ? 1 : i / (n - 1);
+    const r = Math.round(start.r + (end.r - start.r) * t);
+    const g = Math.round(start.g + (end.g - start.g) * t);
+    const b = Math.round(start.b + (end.b - start.b) * t);
+    out.push(rgbToHex(r, g, b));
+  }
+  return out;
+}
+
+async function calculateCityPM25Breaks(cityKey, dateKey, timeKey) {
+  const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+  if (!georaster) return null;
+
+  const vals = sampleRasterValues(georaster, 60000);
+  return calculateJenksBreaks(vals, 100); // ✅ 100 classes
+}
+
+async function calculateGlobalPM25Breaks(dateKey, timeKey) {
+  const all = [];
+  for (const cityKey of Object.keys(cities)) {
+    const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+    if (!georaster) continue;
+    all.push(...sampleRasterValues(georaster, 25000));
+  }
+  return calculateJenksBreaks(all, 100); // ✅ 100 classes
+}
+
 function makeRedRamp(n) {
   const start = hexToRgb('#fff5f0'); // very light
   const end   = hexToRgb('#ef3b2c'); // medium red (stops before super dark)
@@ -1396,8 +1477,12 @@ async function initSensorMarkers() {
       updateTabUI(tab);
 
       if (tab === 'urban') {
-        setTimeout(() => urbanMap && urbanMap.invalidateSize(), 60);
+        setTimeout(async () => {
+          urbanMap && urbanMap.invalidateSize();
+          if (state.layers.pm25) await updatePM25Layer();
+        }, 120);
         refreshUrbanMap();
+        
       } else {
         setTimeout(() => sensorMap && sensorMap.invalidateSize(), 60);
       }
@@ -1482,6 +1567,11 @@ async function initSensorMarkers() {
       // ✅ ADD THIS RIGHT HERE (very end)
       if (state.layers.lst) {
         await updateLSTLayer();
+      }
+
+      // ✅ add PM2.5 refresh
+      if (state.layers.pm25) {
+        await updatePM25Layer();
       }
     }
 
@@ -1608,6 +1698,19 @@ async function initSensorMarkers() {
           await updateLSTLayer();
         }
         
+        urbanMap.once('moveend', async () => {
+          if (pendingMoveEndCityKey !== cityKey) return;
+          if (state.viewMode !== 'single') return;
+          if (state.selectedCity !== cityKey) return;
+          pendingMoveEndCityKey = null;
+
+          if (state.layers.buildings) await updateBuildingLayer();
+          if (state.layers.lst) await updateLSTLayer();
+          if (state.layers.streets) await updateStreetLayer();
+
+          // ✅ add PM2.5
+          if (state.layers.pm25) await updatePM25Layer();
+        });
       });
     }
 
@@ -2203,7 +2306,71 @@ function updateTabUI(tab) {
       }
     }
 
-    function updatePM25Layer() { /* TODO */ }
+async function updatePM25Layer() {
+  if (!urbanMap) return;
+
+  // remove old
+  Object.keys(pm25Layers).forEach((cityKey) => {
+    urbanMap.removeLayer(pm25Layers[cityKey]);
+    delete pm25Layers[cityKey];
+  });
+
+  if (!state.layers.pm25) return;
+
+  const dateKey = state.pm25?.date || "oct3";
+  const timeKey = state.pm25?.time || "08:00";
+
+  // breaks cache buckets
+  globalPM25Breaks[dateKey] ??= {};
+  cityPM25Breaks[dateKey] ??= {};
+  cityPM25Breaks[dateKey][timeKey] ??= {};
+
+  if (state.viewMode === "all") {
+    if (!globalPM25Breaks[dateKey][timeKey]) {
+      globalPM25Breaks[dateKey][timeKey] = await calculateGlobalPM25Breaks(dateKey, timeKey);
+    }
+
+    const breaks = globalPM25Breaks[dateKey][timeKey];
+    if (!breaks?.length) return;
+
+    const palette = makeGreenRamp(breaks.length); 
+    updatePM25Legend(breaks, palette);
+
+    for (const cityKey of Object.keys(cities)) {
+      const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+      if (!georaster) continue;
+
+      const layer = createPM25Layer(cityKey, georaster, breaks, palette);
+      if (layer) {
+        layer.addTo(urbanMap);
+        pm25Layers[cityKey] = layer;
+      }
+    }
+
+  } else {
+    const cityKey = state.selectedCity;
+    if (!cityKey) return;
+
+    if (!cityPM25Breaks[dateKey][timeKey][cityKey]) {
+      cityPM25Breaks[dateKey][timeKey][cityKey] = await calculateCityPM25Breaks(cityKey, dateKey, timeKey);
+    }
+
+    const breaks = cityPM25Breaks[dateKey][timeKey][cityKey];
+    if (!breaks?.length) return;
+
+    const palette = makeGreenRamp(PM25_STOPS, breaks.length);
+    updatePM25Legend(breaks, palette);
+
+    const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+    if (!georaster) return;
+
+    const layer = createPM25Layer(cityKey, georaster, breaks, palette);
+    if (layer) {
+      layer.addTo(urbanMap);
+      pm25Layers[cityKey] = layer;
+    }
+  }
+}
     function updatePM10Layer() { /* TODO */ }
 
     function setPMDate(element, type, date) {
@@ -2218,6 +2385,9 @@ function updateTabUI(tab) {
 
       element.classList.remove('bg-gray-200', 'dark:bg-slate-600');
       element.classList.add(activeColor, 'text-white');
+
+        if (type === "pm25" && state.layers.pm25) updatePM25Layer();
+        if (type === "pm10" && state.layers.pm10) updatePM10Layer();
     }
 
     function setPMTime(element, type, time) {
@@ -2232,10 +2402,14 @@ function updateTabUI(tab) {
 
       element.classList.remove('bg-gray-200', 'dark:bg-slate-600');
       element.classList.add(activeColor, 'text-white');
+      if (type === "pm25" && state.layers.pm25) updatePM25Layer();
+      if (type === "pm10" && state.layers.pm10) updatePM10Layer();
     }
 
-
-
+function toDateTimeLocalValue(d) {
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 
     async function loadAllStreetData() {
       const base = new URL('.', window.location.href);
@@ -2643,63 +2817,45 @@ async function showSensorDetail(stationKey) {
   const st = sensorStations[stationKey];
   if (!st) return;
 
-  document.getElementById('sensor-name').textContent = st.name;
-  document.getElementById('detail-location').textContent =
+  document.getElementById("sensor-name").textContent = st.name;
+  document.getElementById("detail-location").textContent =
     `${st.coords[0].toFixed(4)}, ${st.coords[1].toFixed(4)}`;
 
   const ts = await loadStationTimeSeries(stationKey);
 
-  // ✅ Reset range when opening a station so you don't reuse an old range
-// ✅ Reset range when opening a station so you don't reuse an old range (UTC-safe)
-const fromEl = document.getElementById("ts-from");
-const toEl = document.getElementById("ts-to");
+  // Reset date inputs to last 24 hours
+  const fromEl = document.getElementById("ts-from");
+  const toEl = document.getElementById("ts-to");
 
-if (ts?.maxDate && fromEl && toEl) {
-  const toD = new Date(ts.maxDate.getTime());
-  const fromD = new Date(ts.maxDate.getTime() - 24 * 3600 * 1000);
+  if (ts?.maxDate && fromEl && toEl) {
+    const toD = new Date(ts.maxDate.getTime());
+    const fromD = new Date(ts.maxDate.getTime() - 24 * 3600 * 1000);
 
-  // IMPORTANT: use UTC formatter, not local
-  fromEl.value = toDateTimeLocalUTCValue(fromD);
-  toEl.value   = toDateTimeLocalUTCValue(toD);
-}
+    // ✅ CORRECT: different values
+    fromEl.value = toDateTimeLocalValue(fromD);
+    toEl.value   = toDateTimeLocalValue(toD);
+  }
 
   const { from, to } = readRangeInputsOrDefault(ts);
+  const metric = document.getElementById("ts-metric").value || "pm25";
 
-  const metricKey = document.getElementById("ts-metric")?.value || "pm25";
-  const filtered = filterRowsByRange(ts.rows || [], from, to);
+  const filtered = filterRowsByRange(ts.rows, from, to);
 
-  // ✅ Show panel FIRST (so canvas has size)
-  const panel = document.getElementById('sensor-detail');
-  panel.classList.remove('hidden');
+  // show panel FIRST
+  const panel = document.getElementById("sensor-detail");
+  panel.classList.remove("hidden");
 
-  // update "Last Update"
-  const lastT = filtered.length ? filtered[filtered.length - 1].t : ts.maxDate;
-  document.getElementById('detail-update').textContent =
-    lastT ? lastT.toISOString().replace("T", " ").slice(0, 16) + " UTC" : "--";
-
-  // ✅ Render on next frame after layout
   requestAnimationFrame(() => {
-    renderTimeSeriesChart(filtered, metricKey);
+    renderTimeSeriesChart(filtered, metric);
   });
 
   // Apply button
-  const applyBtn = document.getElementById("ts-apply");
-  if (applyBtn) {
-    applyBtn.onclick = async () => {
-      const ts2 = await loadStationTimeSeries(stationKey);
-      const { from: f2, to: t2 } = readRangeInputsOrDefault(ts2);
-      const metric2 = document.getElementById("ts-metric")?.value || "pm25";
-      const filtered2 = filterRowsByRange(ts2.rows || [], f2, t2);
-
-      const lastT2 = filtered2.length ? filtered2[filtered2.length - 1].t : ts2.maxDate;
-      document.getElementById('detail-update').textContent =
-        lastT2 ? lastT2.toISOString().replace("T", " ").slice(0, 16) + " UTC" : "--";
-
-      requestAnimationFrame(() => {
-        renderTimeSeriesChart(filtered2, metric2);
-      });
-    };
-  }
+  document.getElementById("ts-apply").onclick = () => {
+    const { from, to } = readRangeInputsOrDefault(ts);
+    const metric = document.getElementById("ts-metric").value;
+    const filtered = filterRowsByRange(ts.rows, from, to);
+    renderTimeSeriesChart(filtered, metric);
+  };
 }
 
     function closeSensorDetail() {
@@ -2806,6 +2962,125 @@ function syncFloatingButtonsVisibility() {
   }
 }
 
+function pm25Folder(dateKey) {
+  // dateKey values you already use: "oct3" / "oct4"
+  return dateKey === "oct3" ? "PM25_1003" : "PM25_1004";
+}
+
+function pm25DateStamp(dateKey) {
+  return dateKey === "oct3" ? "20251003" : "20251004";
+}
+
+// state.pm25.time is "08:00" etc → filenames use "0800"
+function pm25TimeStamp(timeKey) {
+  return String(timeKey).replace(":", "");
+}
+
+async function loadPM25Raster(cityKey, dateKey, timeKey) {
+  pm25RasterCache[dateKey] ??= {};
+  pm25RasterCache[dateKey][cityKey] ??= {};
+  if (pm25RasterCache[dateKey][cityKey][timeKey]) return pm25RasterCache[dateKey][cityKey][timeKey];
+
+  const code = PM25_CITY_CODE[cityKey];
+  if (!code) return null;
+
+  const folder = pm25Folder(dateKey);
+  const dateStamp = pm25DateStamp(dateKey);
+  const timeStamp = pm25TimeStamp(timeKey);
+
+  // Example: data/PM25_1003/PM25_PL_20251003_0800.tif
+  const base = new URL(".", window.location.href);
+  const url = new URL(`data/${folder}/PM25_${code}_${dateStamp}_${timeStamp}.tif`, base).toString();
+
+  try {
+    console.log(`[PM25] Fetching ${cityKey} ${dateKey} ${timeKey}: ${url}`);
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+
+    const arrayBuffer = await res.arrayBuffer();
+    const georaster = await parseGeoraster(arrayBuffer);
+
+    pm25RasterCache[dateKey][cityKey][timeKey] = georaster;
+    return georaster;
+  } catch (e) {
+    console.warn(`[PM25] Failed to load ${cityKey} ${dateKey} ${timeKey}:`, e);
+    pm25RasterCache[dateKey][cityKey][timeKey] = null;
+    return null;
+  }
+}
+
+async function calculateCityPM25Breaks(cityKey, dateKey, timeKey) {
+  const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+  if (!georaster) return null;
+
+  const vals = sampleRasterValues(georaster, 60000);
+  return calculateJenksBreaks(vals, 10);
+}
+
+async function calculateGlobalPM25Breaks(dateKey, timeKey) {
+  const all = [];
+  for (const cityKey of Object.keys(cities)) {
+    const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+    if (!georaster) continue;
+    all.push(...sampleRasterValues(georaster, 25000));
+  }
+  return calculateJenksBreaks(all, 10);
+}
+
+function updatePM25Legend(breaks, palette) {
+  const wrap = document.getElementById("pm25-options");
+  if (!wrap || !breaks?.length) return;
+
+  // Find the gradient bar inside PM2.5 panel
+  const bar = wrap.querySelector(".color-bar-pm25");
+
+  // Find the min/mid/max label row
+  const row = wrap.querySelector(".flex.justify-between.text-xs");
+
+  const minVal = breaks[0];
+  const midVal = breaks[Math.floor(breaks.length / 2)];
+  const maxVal = breaks[breaks.length - 1];
+
+  // Update numeric labels
+  if (row) {
+    row.innerHTML = `
+      <span>${minVal.toFixed(1)}</span>
+      <span>${midVal.toFixed(1)}</span>
+      <span>${maxVal.toFixed(1)}+</span>
+    `;
+  }
+
+  // ✅ THIS is where it goes
+  if (bar) {
+    setLegendGradient(bar, palette);
+  }
+}
+
+function createPM25Layer(cityKey, georaster, breaks, palette) {
+  if (!urbanMap || !georaster || !breaks?.length) return null;
+
+  if (!urbanMap.getPane("pm25Pane")) {
+    urbanMap.createPane("pm25Pane");
+    urbanMap.getPane("pm25Pane").style.zIndex = 410; // under LST (420) and buildings/streets
+  }
+
+  const noData = georaster.noDataValue;
+
+  return new GeoRasterLayer({
+    georaster,
+    pane: "pm25Pane",
+    opacity: 0.75,
+    resolution: 256,
+    pixelValuesToColorFn: (vals) => {
+      const v = vals?.[0];
+      if (v == null || Number.isNaN(v)) return null;
+      if (noData != null && v === noData) return null;
+      return getColorFromBreaksPalette(Number(v), breaks, palette);
+    }
+  });
+}
+
+
 
 // =====================
 // One Time-Series Chart (CSV-backed)
@@ -2835,9 +3110,9 @@ function toDateTimeLocalUTCValue(d) {
 }
 
 // Parse datetime-local as UTC (not local)
-function parseDateTimeLocalAsUTC(value) {
-  // value like "2026-01-04T14:50"
-  return value ? new Date(value + "Z") : null;
+function parseDateTimeLocalAsLocal(value) {
+  // value like "2026-01-04T14:50" -> local Date
+  return value ? new Date(value) : null;
 }
 
 function parseCSVLine(line) {
@@ -2856,17 +3131,14 @@ function parseCSVLine(line) {
   return out.map(s => s.trim().replace(/^\uFEFF/, ""));
 }
 
-function parseUTCDate(s) {
+function parseLocalDateTime(s) {
   if (!s) return null;
 
-  // Normalize spaces to T
+  // normalize "YYYY-MM-DD HH:mm:ss" -> "YYYY-MM-DDTHH:mm:ss"
   const isoLike = s.includes("T") ? s : s.replace(" ", "T");
 
-  // If the string already has timezone info (Z or ±hh:mm), don't append Z
-  const hasTZ = /Z$|[+\-]\d{2}:\d{2}$/.test(isoLike);
-  const normalized = hasTZ ? isoLike : (isoLike + "Z");
-
-  const d = new Date(normalized);
+  // IMPORTANT: do NOT append Z (Z makes it UTC)
+  const d = new Date(isoLike);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -2888,91 +3160,42 @@ async function loadStationTimeSeries(stationKey) {
     const lines = text.split(/\r?\n/).filter(l => l.trim().length);
     if (!lines.length) throw new Error("Empty CSV");
 
-    const headerRaw = parseCSVLine(lines[0]);
-    const header = headerRaw.map(normHeader);
-    const idx = Object.fromEntries(header.map((h, i) => [h, i]));
+    const header = parseCSVLine(lines[0]);
+    const idx = Object.fromEntries(header.map((h, i) => [h.trim(), i]));
 
-    console.log("[Timeseries] file:", st.file);
-    console.log("[Timeseries] headers:", headerRaw);
-    console.log("[Timeseries] normalized:", header);
+    console.log("[Timeseries] headers:", header);
 
-    // ---- Robust column resolution (handles variants / renamed headers) ----
-    const resolveIndex = (candidates) => {
-      const list = Array.isArray(candidates) ? candidates : [candidates];
-      for (const k of list) {
-        const j = idx[normHeader(k)];
-        if (j != null) return j;
-      }
-      return null;
-    };
+    // --- EXACT column names from your CSV ---
+    const localIdx = idx["local_date_time"];
+    const pm25Idx  = idx["pm25_ug_m3_corrected"];
+    const pm10Idx  = idx["pm10_ug_m3"];
+    const humIdx   = idx["humidity_percent_corrected"];
+    const tempIdx  = idx["temperature_c_corrected"];
 
-    // If you want, you can expand these candidate lists to match your real CSVs.
-    const utcIdx = resolveIndex([
-      TS_COLS.utc,
-      "utc_datetime",
-      "utc date time",
-      "utc_date",
-      "datetime_utc",
-      "date_time_utc",
-      "date_time",
-      "datetime",
-      "timestamp",
-      "time",
-    ]);
-
-    const pm25Idx = resolveIndex([
-      TS_COLS.pm25,
-      "pm2.5_ug_m3_corrected",
-      "pm2_5_ug_m3_corrected",
-      "pm25",
-      "pm2.5",
-      "pm2_5",
-    ]);
-
-    const pm10Idx = resolveIndex([
-      TS_COLS.pm10,
-      "pm10",
-      "pm10_ug_m3_corrected",
-    ]);
-
-    const humIdx = resolveIndex([
-      TS_COLS.humidity,
-      "humidity",
-      "rh",
-      "relative_humidity",
-      "humidity_percent",
-    ]);
-
-    const tempIdx = resolveIndex([
-      TS_COLS.temperature,
-      "temperature",
-      "temp",
-      "temp_c",
-      "temperature_c",
-    ]);
-
-    console.log("[Timeseries] resolved idx:", {
-      utcIdx, pm25Idx, pm10Idx, humIdx, tempIdx
+    console.log("[Timeseries] column indices:", {
+      localIdx, pm25Idx, pm10Idx, humIdx, tempIdx
     });
 
-    if (utcIdx == null) {
-      throw new Error(`UTC datetime column not found. Headers: ${headerRaw.join(", ")}`);
+    if (localIdx == null) {
+      throw new Error("local_date_time column not found.");
     }
 
     const toNum = (cols, j) => {
       if (j == null) return null;
-      const v = Number(String(cols[j]).trim());
+      const v = Number(cols[j]);
       return Number.isFinite(v) ? v : null;
     };
 
     const rows = [];
+
     for (let i = 1; i < lines.length; i++) {
       const cols = parseCSVLine(lines[i]);
       if (!cols?.length) continue;
 
-      const tStr = cols[utcIdx];
-      const t = parseUTCDate(tStr);
-      if (!t) continue;
+      // Convert "2026-01-04 22:50:00" → Date
+      const localStr = cols[localIdx];
+      const t = new Date(localStr.replace(" ", "T")); // no Z, local time
+      if (isNaN(t.getTime())) continue;
 
       rows.push({
         t,
@@ -2984,6 +3207,7 @@ async function loadStationTimeSeries(stationKey) {
     }
 
     rows.sort((a, b) => a.t - b.t);
+
     const minDate = rows[0]?.t ?? null;
     const maxDate = rows[rows.length - 1]?.t ?? null;
 
@@ -2991,6 +3215,7 @@ async function loadStationTimeSeries(stationKey) {
 
     timeSeriesCache[stationKey] = { rows, minDate, maxDate };
     return timeSeriesCache[stationKey];
+
   } catch (e) {
     console.warn("[Timeseries] load failed:", stationKey, e);
     timeSeriesCache[stationKey] = { rows: [], minDate: null, maxDate: null };
@@ -3008,14 +3233,17 @@ function readRangeInputsOrDefault(ts) {
   const toEl   = document.getElementById("ts-to");
 
   const maxD = ts?.maxDate ?? new Date();
-  const defaultTo   = new Date(maxD.getTime());
+  const defaultTo = new Date(maxD.getTime());
   const defaultFrom = new Date(maxD.getTime() - 24 * 3600 * 1000);
 
-  if (fromEl && !fromEl.value) fromEl.value = toDateTimeLocalUTCValue(defaultFrom);
-  if (toEl && !toEl.value)     toEl.value   = toDateTimeLocalUTCValue(defaultTo);
+  if (fromEl && !fromEl.value)
+    fromEl.value = defaultFrom.toISOString().slice(0,16);
 
-  const from = parseDateTimeLocalAsUTC(fromEl?.value) ?? defaultFrom;
-  const to   = parseDateTimeLocalAsUTC(toEl?.value)   ?? defaultTo;
+  if (toEl && !toEl.value)
+    toEl.value = defaultTo.toISOString().slice(0,16);
+
+  const from = fromEl?.value ? new Date(fromEl.value) : defaultFrom;
+  const to   = toEl?.value   ? new Date(toEl.value)   : defaultTo;
 
   return { from, to };
 }
@@ -3047,21 +3275,22 @@ function renderTimeSeriesChart(filtered, metricKey) {
     .filter(r => r[metricKey] != null)
     .map(r => ({ x: r.t, y: r[metricKey] }));
 
-  console.log("[TS] metric:", metricKey, "points:", points.length, "first:", points[0], "last:", points.at(-1));
+  console.log("[Chart] metric:", metricKey, "points:", points.length);
 
-  console.log("[Chart] metric:", metricKey, "filtered rows:", filtered.length, "points:", points.length);
-
-  if (tsChart) { tsChart.destroy(); tsChart = null; }
+  if (tsChart) {
+    tsChart.destroy();
+    tsChart = null;
+  }
 
   tsChart = new Chart(canvas, {
     type: "line",
     data: {
       datasets: [{
-        label: metricLabel(metricKey),
+        label: metricKey,
         data: points,
+        borderWidth: 2,
         pointRadius: 0,
-        tension: 0.25,
-        spanGaps: true,
+        tension: 0.3
       }]
     },
     options: {
@@ -3071,14 +3300,8 @@ function renderTimeSeriesChart(filtered, metricKey) {
       scales: {
         x: {
           type: "time",
-          time: { tooltipFormat: "yyyy-LL-dd HH:mm" },
-          ticks: { maxTicksLimit: 5 }
-        },
-        y: { ticks: { maxTicksLimit: 5 } }
-      },
-      plugins: {
-        legend: { display: false },
-        tooltip: { intersect: false, mode: "index" }
+          time: { tooltipFormat: "yyyy-LL-dd HH:mm" }
+        }
       }
     }
   });
