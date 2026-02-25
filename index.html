@@ -1166,6 +1166,7 @@
     let pm25RasterCache = {};            // { dateKey: { cityKey: { timeKey: georaster } } }
     let globalPM25Breaks = {};           // { dateKey: { timeKey: breaks[] } }
     let cityPM25Breaks = {};             // { dateKey: { timeKey: { cityKey: breaks[] } } }
+    let pm25RenderToken = 0;
 
     // Map your city keys -> XX codes
     const PM25_CITY_CODE = {
@@ -1215,7 +1216,7 @@
     let buildingLayers = {};
     let streetLayers = {};
     let sensorMarkers = {};
-
+    let cityBoundsCache = {}; // { cityKey: L.LatLngBounds }
     let buildingDataCache = {};
     let globalBreaks = null;
     let cityBreaks = {};
@@ -1266,7 +1267,9 @@
 
       urbanMap.createPane('buildingsPane');
       urbanMap.getPane('buildingsPane').style.zIndex = 450;
-
+      urbanMap.on("click", async (e) => {
+        await loadCityDataFromClick(e.latlng);
+      });
       const startBasemap = basemaps[state.basemap] ? state.basemap : 'light';
 
       basemapLayers.urban = L.tileLayer(basemaps[startBasemap], {
@@ -1892,7 +1895,45 @@ function updateTabUI(tab) {
           console.warn(`Using fallback center for ${cityKey}`);
         }
       });
+      buildCityBoundsCache();
     }
+
+  async function loadCityDataFromClick(latlng) {
+    const cityKey = cityKeyFromLatLng(latlng);
+    if (!cityKey) {
+      console.log("[Click→City] No study area found at", latlng);
+      return;
+    }
+
+    // Switch to single city mode and select it
+    if (state.viewMode !== "single") await setViewMode("single");
+    state.selectedCity = cityKey;
+    pendingMoveEndCityKey = cityKey;
+
+    // UI highlight
+    document.querySelectorAll(".city-btn").forEach(btn => btn.classList.remove("border-emerald-500"));
+    document.querySelector(`[data-city="${cityKey}"]`)?.classList.add("border-emerald-500");
+
+    // Fly to clicked point (or you can fly to city.center)
+    const city = cities[cityKey];
+    urbanMap.flyTo(latlng, city?.zoom ?? 16, { duration: 0.8 });
+
+    // After map settles, refresh visible layers (overwrite existing)
+    urbanMap.once("moveend", async () => {
+      if (pendingMoveEndCityKey !== cityKey) return;
+      if (state.viewMode !== "single") return;
+      if (state.selectedCity !== cityKey) return;
+      pendingMoveEndCityKey = null;
+
+      if (state.layers.buildings) await updateBuildingLayer();
+      if (state.layers.lst)       await updateLSTLayer();   // overwrites (your code clears old layers)
+      if (state.layers.streets)   await updateStreetLayer();
+      if (state.layers.pm25)      await updatePM25Layer();  // overwrites (your code clears old layers)
+      if (state.layers.pm10)      await updatePM10Layer();  // when implemented
+    });
+
+    console.log("[Click→City] Loaded:", cityKey);
+  }
 
     // =====================
     // Calculate Jenks Breaks
@@ -2283,6 +2324,9 @@ function updateTabUI(tab) {
 async function updatePM25Layer() {
   if (!urbanMap) return;
 
+  // ✅ token for this run
+  const token = ++pm25RenderToken;
+
   // remove old
   Object.keys(pm25Layers).forEach((cityKey) => {
     urbanMap.removeLayer(pm25Layers[cityKey]);
@@ -2294,24 +2338,26 @@ async function updatePM25Layer() {
   const dateKey = state.pm25?.date || "oct3";
   const timeKey = state.pm25?.time || "08:00";
 
-  // breaks cache buckets
   globalPM25Breaks[dateKey] ??= {};
   cityPM25Breaks[dateKey] ??= {};
   cityPM25Breaks[dateKey][timeKey] ??= {};
 
   if (state.viewMode === "all") {
     if (!globalPM25Breaks[dateKey][timeKey]) {
-      globalPM25Breaks[dateKey][timeKey] = await calculateGlobalPM25Breaks(dateKey, timeKey);
+      const b = await calculateGlobalPM25Breaks(dateKey, timeKey);
+      if (token !== pm25RenderToken) return; // ✅ stale
+      globalPM25Breaks[dateKey][timeKey] = b;
     }
 
     const breaks = globalPM25Breaks[dateKey][timeKey];
     if (!breaks?.length) return;
 
-    const palette = makeGreenRamp(breaks.length); 
+    const palette = makeGreenRamp(breaks.length);
     updatePM25Legend(breaks, palette);
 
     for (const cityKey of Object.keys(cities)) {
       const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+      if (token !== pm25RenderToken) return; // ✅ stale
       if (!georaster) continue;
 
       const layer = createPM25Layer(cityKey, georaster, breaks, palette);
@@ -2320,13 +2366,14 @@ async function updatePM25Layer() {
         pm25Layers[cityKey] = layer;
       }
     }
-
   } else {
     const cityKey = state.selectedCity;
     if (!cityKey) return;
 
     if (!cityPM25Breaks[dateKey][timeKey][cityKey]) {
-      cityPM25Breaks[dateKey][timeKey][cityKey] = await calculateCityPM25Breaks(cityKey, dateKey, timeKey);
+      const b = await calculateCityPM25Breaks(cityKey, dateKey, timeKey);
+      if (token !== pm25RenderToken) return; // ✅ stale
+      cityPM25Breaks[dateKey][timeKey][cityKey] = b;
     }
 
     const breaks = cityPM25Breaks[dateKey][timeKey][cityKey];
@@ -2336,6 +2383,7 @@ async function updatePM25Layer() {
     updatePM25Legend(breaks, palette);
 
     const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
+    if (token !== pm25RenderToken) return; // ✅ stale
     if (!georaster) return;
 
     const layer = createPM25Layer(cityKey, georaster, breaks, palette);
@@ -2345,6 +2393,7 @@ async function updatePM25Layer() {
     }
   }
 }
+
     function updatePM10Layer() { /* TODO */ }
 
     function setPMDate(element, type, date) {
@@ -2978,23 +3027,6 @@ async function loadPM25Raster(cityKey, dateKey, timeKey) {
   }
 }
 
-async function calculateCityPM25Breaks(cityKey, dateKey, timeKey) {
-  const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
-  if (!georaster) return null;
-
-  const vals = sampleRasterValues(georaster, 60000);
-  return calculateJenksBreaks(vals, 100);
-}
-
-async function calculateGlobalPM25Breaks(dateKey, timeKey) {
-  const all = [];
-  for (const cityKey of Object.keys(cities)) {
-    const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
-    if (!georaster) continue;
-    all.push(...sampleRasterValues(georaster, 25000));
-  }
-  return calculateJenksBreaks(all, 100);
-}
 
 function updatePM25Legend(breaks, palette) {
   const wrap = document.getElementById("pm25-options");
@@ -3224,6 +3256,49 @@ function filterRowsByRange(rows, from, to) {
     const t = r.t.getTime();
     return t >= a && t <= b;
   });
+}
+
+function computeCityBoundsFromBuildings(cityKey) {
+  const geojsonData = buildingDataCache[cityKey];
+  if (!geojsonData?.features?.length) return null;
+
+  const bounds = L.latLngBounds([]);
+  for (const f of geojsonData.features) {
+    const g = f?.geometry;
+    if (!g) continue;
+
+    const pushCoord = (lng, lat) => {
+      if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+        bounds.extend([lat, lng]);
+      }
+    };
+
+    if (g.type === "Polygon") {
+      const ring = g.coordinates?.[0] || [];
+      for (const [lng, lat] of ring) pushCoord(lng, lat);
+    } else if (g.type === "MultiPolygon") {
+      for (const poly of g.coordinates || []) {
+        const ring = poly?.[0] || [];
+        for (const [lng, lat] of ring) pushCoord(lng, lat);
+      }
+    }
+  }
+
+  return bounds.isValid() ? bounds : null;
+}
+
+function buildCityBoundsCache() {
+  cityBoundsCache = {};
+  for (const cityKey of Object.keys(cities)) {
+    const b = computeCityBoundsFromBuildings(cityKey);
+    if (b) cityBoundsCache[cityKey] = b;
+  }
+}
+
+// Returns the city whose bounds contains the point; null if none.
+function cityKeyFromLatLng(latlng) {
+  const hit = Object.entries(cityBoundsCache).find(([_, b]) => b.contains(latlng));
+  return hit ? hit[0] : null;
 }
 
 function metricLabel(metricKey) {
