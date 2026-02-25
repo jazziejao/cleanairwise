@@ -720,7 +720,7 @@
                     <button onclick="setPMTime(this, 'pm25', '17:00')" class="pm25-time-btn px-2 py-1 text-xs rounded bg-gray-200 dark:bg-slate-600">17:00</button>
                     <button onclick="setPMTime(this, 'pm25', '21:00')" class="pm25-time-btn px-2 py-1 text-xs rounded bg-gray-200 dark:bg-slate-600">21:00</button>
                   </div>
-                  <div class="color-bar-pm25 h-2 rounded-full"></div>
+
 
                   <div class="color-bar-pm25 w-full h-3 rounded mb-1"></div>
                   <div class="flex justify-between text-xs text-gray-500 dark:text-gray-400 mono"><span>0</span><span>35</span><span>150+</span></div>
@@ -1675,42 +1675,15 @@ async function initSensorMarkers() {
       urbanMap.flyTo(city.center, city.zoom, { duration: 1 });
 
       urbanMap.once('moveend', async () => {
-        // Bail if: stale city key, mode flipped back to 'all', or selectedCity changed.
-        // All three guards are needed because invalidateSize also fires moveend.
         if (pendingMoveEndCityKey !== cityKey) return;
         if (state.viewMode !== 'single') return;
         if (state.selectedCity !== cityKey) return;
         pendingMoveEndCityKey = null;
 
-        if (state.layers.buildings) {
-          await updateBuildingLayer();
-        }
-
-        if (state.layers.lst) {
-          await updateLSTLayer();
-        }
-
-        if (state.layers.streets) {
-          await updateStreetLayer();
-        }
-
-        if (state.layers.lst) {
-          await updateLSTLayer();
-        }
-        
-        urbanMap.once('moveend', async () => {
-          if (pendingMoveEndCityKey !== cityKey) return;
-          if (state.viewMode !== 'single') return;
-          if (state.selectedCity !== cityKey) return;
-          pendingMoveEndCityKey = null;
-
-          if (state.layers.buildings) await updateBuildingLayer();
-          if (state.layers.lst) await updateLSTLayer();
-          if (state.layers.streets) await updateStreetLayer();
-
-          // ✅ add PM2.5
-          if (state.layers.pm25) await updatePM25Layer();
-        });
+        if (state.layers.buildings) await updateBuildingLayer();
+        if (state.layers.lst) await updateLSTLayer();
+        if (state.layers.streets) await updateStreetLayer();
+        if (state.layers.pm25) await updatePM25Layer();
       });
     }
 
@@ -2358,7 +2331,7 @@ async function updatePM25Layer() {
     const breaks = cityPM25Breaks[dateKey][timeKey][cityKey];
     if (!breaks?.length) return;
 
-    const palette = makeGreenRamp(PM25_STOPS, breaks.length);
+    const palette = makeGreenRamp(breaks.length);
     updatePM25Legend(breaks, palette);
 
     const georaster = await loadPM25Raster(cityKey, dateKey, timeKey);
@@ -2675,7 +2648,7 @@ function createLSTLayer(cityKey, georaster, breaks, palette) {
   return new GeoRasterLayer({
     georaster,
     pane: 'lstPane',
-    opacity: 0.75,
+    opacity: 1,
     resolution: 256,
     pixelValuesToColorFn: (vals) => {
       const v = vals?.[0];
@@ -3014,7 +2987,7 @@ async function calculateCityPM25Breaks(cityKey, dateKey, timeKey) {
   if (!georaster) return null;
 
   const vals = sampleRasterValues(georaster, 60000);
-  return calculateJenksBreaks(vals, 10);
+  return calculateJenksBreaks(vals, 100);
 }
 
 async function calculateGlobalPM25Breaks(dateKey, timeKey) {
@@ -3024,7 +2997,7 @@ async function calculateGlobalPM25Breaks(dateKey, timeKey) {
     if (!georaster) continue;
     all.push(...sampleRasterValues(georaster, 25000));
   }
-  return calculateJenksBreaks(all, 10);
+  return calculateJenksBreaks(all, 100);
 }
 
 function updatePM25Legend(breaks, palette) {
@@ -3069,7 +3042,7 @@ function createPM25Layer(cityKey, georaster, breaks, palette) {
   return new GeoRasterLayer({
     georaster,
     pane: "pm25Pane",
-    opacity: 0.75,
+    opacity: 1,
     resolution: 256,
     pixelValuesToColorFn: (vals) => {
       const v = vals?.[0];
