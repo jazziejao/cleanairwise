@@ -5,6 +5,39 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AIRWISE Dashboard</title>
 
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            primary: {
+              50: '#f0fdf4',
+              100: '#dcfce7',
+              200: '#bbf7d0',
+              300: '#86efac',
+              400: '#4ade80',
+              500: '#22c55e',
+              600: '#16a34a',
+              700: '#15803d',
+              800: '#166534',
+              900: '#14532d',
+            },
+            accent: {
+              DEFAULT: '#06b6d4',
+              light: '#22d3ee',
+              dark: '#0891b2',
+            },
+            surface: {
+              light: '#ffffff',
+              dark: '#0f172a',
+            }
+          }
+        }
+      }
+    };
+  </script>
+
   <!-- Tailwind (CDN) -->
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
 
@@ -165,38 +198,6 @@
 
   </style>
 
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            primary: {
-              50: '#f0fdf4',
-              100: '#dcfce7',
-              200: '#bbf7d0',
-              300: '#86efac',
-              400: '#4ade80',
-              500: '#22c55e',
-              600: '#16a34a',
-              700: '#15803d',
-              800: '#166534',
-              900: '#14532d',
-            },
-            accent: {
-              DEFAULT: '#06b6d4',
-              light: '#22d3ee',
-              dark: '#0891b2',
-            },
-            surface: {
-              light: '#ffffff',
-              dark: '#0f172a',
-            }
-          }
-        }
-      }
-    };
-  </script>
 </head>
 
 <body class="h-full bg-gray-50 dark:bg-slate-900 text-gray-900 dark:text-gray-100 overflow-hidden m-0 p-0">
@@ -2379,10 +2380,6 @@ async function updatePM25Layer() {
       if (type === "pm10" && state.layers.pm10) updatePM10Layer();
     }
 
-function toDateTimeLocalValue(d) {
-  const pad = n => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
 
     async function loadAllStreetData() {
       const base = new URL('.', window.location.href);
@@ -2804,9 +2801,8 @@ async function showSensorDetail(stationKey) {
     const toD = new Date(ts.maxDate.getTime());
     const fromD = new Date(ts.maxDate.getTime() - 24 * 3600 * 1000);
 
-    // ✅ CORRECT: different values
-    fromEl.value = toDateTimeLocalValue(fromD);
-    toEl.value   = toDateTimeLocalValue(toD);
+    if (fromEl && !fromEl.value) fromEl.value = toDateTimeLocalValue(defaultFrom);
+    if (toEl && !toEl.value)     toEl.value   = toDateTimeLocalValue(defaultTo);
   }
 
   const { from, to } = readRangeInputsOrDefault(ts);
